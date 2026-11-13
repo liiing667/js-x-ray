@@ -42,12 +42,15 @@ export class Inlined {
       virtualDeclaration: {
         type: "VariableDeclaration",
         kind: "const",
+        ...(node.loc ? { loc: node.loc } : {}),
         declarations: [
           {
             type: "VariableDeclarator",
+            ...(node.loc ? { loc: node.loc } : {}),
             id: {
               type: "Identifier",
-              name: virtualIdentifier
+              name: virtualIdentifier,
+              ...(node.loc ? { loc: node.loc } : {})
             },
             init: target
           }
@@ -73,7 +76,8 @@ export class Inlined {
 
     const virtualId: ESTree.Identifier = {
       type: "Identifier",
-      name: virtualIdentifier
+      name: virtualIdentifier,
+      ...(target.loc ? { loc: target.loc } : {})
     };
 
     return Inlined.#cloneAndReplace(

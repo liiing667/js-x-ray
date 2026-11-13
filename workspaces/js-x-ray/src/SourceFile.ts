@@ -20,6 +20,7 @@ import {
 } from "./utils/index.ts";
 import {
   generateWarning,
+  dedupeAndSortWarnings,
   type Warning
 } from "./warnings.ts";
 import { CollectableSetRegistry } from "./CollectableSetRegistry.ts";
@@ -52,6 +53,12 @@ export class SourceFile {
   metadata?: Record<string, unknown>;
   collectablesSetRegistry: CollectableSetRegistry;
   packageName?: string;
+  /**
+   * When set (e.g. while unrolling a nested eval payload), locations
+   * reported to this SourceFile are overridden with the location of
+   * the original Literal in the source file.
+   */
+  locationOverride: ESTree.SourceLocation | null = null;
 
   constructor(
     sourceLocation?: string,
@@ -74,18 +81,20 @@ export class SourceFile {
       return;
     }
 
+    const effectiveLocation = this.locationOverride ?? location;
+
     const dependencyName = name.charAt(name.length - 1) === "/" ?
       name.slice(0, -1) : name;
     this.dependencies.set(dependencyName, {
       unsafe,
       inTry: this.inTryStatement,
-      ...(location ? { location } : {})
+      ...(effectiveLocation ? { location: effectiveLocation } : {})
     });
     if (this.packageName !== dependencyName) {
       this.collectablesSetRegistry.add("dependency", {
         value: dependencyName,
         file: this.path.location,
-        location: toArrayLocation(location ?? undefined),
+        location: toArrayLocation(effectiveLocation ?? undefined),
         metadata: {
           ...this.metadata,
           inTry: this.inTryStatement,
@@ -98,7 +107,7 @@ export class SourceFile {
       this.warnings.push(
         generateWarning("unsafe-import", {
           value: dependencyName,
-          location: location || void 0
+          location: effectiveLocation || void 0
         })
       );
     }
@@ -112,14 +121,16 @@ export class SourceFile {
       return;
     }
 
+    const effectiveLocation = this.locationOverride ?? location;
+
     if (this.encodedLiterals.has(value)) {
       const index = this.encodedLiterals.get(value)!;
-      this.warnings[index].location.push(toArrayLocation(location ?? rootLocation()));
+      this.warnings[index].location.push(toArrayLocation(effectiveLocation ?? rootLocation()));
 
       return;
     }
 
-    this.warnings.push(generateWarning("encoded-literal", { value, location }));
+    this.warnings.push(generateWarning("encoded-literal", { value, location: effectiveLocation }));
     this.encodedLiterals.set(value, String(this.warnings.length - 1));
   }
 
@@ -193,6 +204,8 @@ export class SourceFile {
       this.warnings = this.warnings
         .filter((warning) => warning.kind !== "encoded-literal");
     }
+
+    this.warnings = dedupeAndSortWarnings(this.warnings);
 
     return {
       idsLengthAvg,

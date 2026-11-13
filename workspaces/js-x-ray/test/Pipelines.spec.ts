@@ -8,7 +8,12 @@ import {
   Pipelines
 } from "../src/index.ts";
 import {
-  getWarningKind
+  resolveStringConcatenation,
+  StringConcat
+} from "../src/pipelines/stringConcat.ts";
+import {
+  getWarningKind,
+  parseScript
 } from "./helpers.ts";
 
 describe("AstAnalyser pipelines", () => {
@@ -80,5 +85,59 @@ describe("Pipelines.deobfuscate", () => {
       getWarningKind(warnings),
       ["shady-link"].sort()
     );
+  });
+});
+
+describe("resolveStringConcatenation", () => {
+  test("should resolve a concatenation of string Literals", () => {
+    const ast = parseScript(`"con" + "sole." + "log";`);
+    const [statement] = ast.body;
+
+    assert.strictEqual(
+      resolveStringConcatenation(statement.expression),
+      "console.log"
+    );
+  });
+
+  test("should return null when any leaf is not a string Literal", () => {
+    for (const source of [
+      `"con" + foo`,
+      `"con" + 1`,
+      `"con" - "sole"`,
+      "1 + 2"
+    ]) {
+      const ast = parseScript(`${source};`);
+      const [statement] = ast.body;
+
+      assert.strictEqual(
+        resolveStringConcatenation(statement.expression),
+        null
+      );
+    }
+  });
+});
+
+describe("StringConcat pipeline", () => {
+  test("should fold a string concatenation into a Literal preserving the original location", () => {
+    const ast = parseScript(`const foo = "con" + "sole";`);
+
+    new StringConcat().walk(ast.body);
+
+    const [declaration] = ast.body[0].declarations;
+    assert.strictEqual(declaration.init.type, "Literal");
+    assert.strictEqual(declaration.init.value, "console");
+    assert.deepEqual(declaration.init.loc, {
+      start: { line: 1, column: 12 },
+      end: { line: 1, column: 26 }
+    });
+  });
+
+  test("should not fold concatenations with non-string leaves", () => {
+    const ast = parseScript(`const foo = "con" + bar;`);
+
+    new StringConcat().walk(ast.body);
+
+    const [declaration] = ast.body[0].declarations;
+    assert.strictEqual(declaration.init.type, "BinaryExpression");
   });
 });

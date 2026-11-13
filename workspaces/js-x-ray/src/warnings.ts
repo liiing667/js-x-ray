@@ -235,3 +235,98 @@ export function generateWarning<T extends WarningName>(
   };
 }
 
+function normalizeLocations(
+  location: Warning["location"]
+): SourceArrayLocation[] {
+  if (location === null) {
+    return [];
+  }
+  /*
+   * Custom probes may report a raw ESTree.SourceLocation object
+   * instead of the array form.
+   */
+  if (typeof location === "object" && !Array.isArray(location) && "start" in location) {
+    return [toArrayLocation(location as ESTree.SourceLocation)];
+  }
+  if (!Array.isArray(location) || location.length === 0) {
+    return [];
+  }
+
+  return Array.isArray(location[0]?.[0]) ?
+    location as SourceArrayLocation[] :
+    [location as SourceArrayLocation];
+}
+
+function warningIdentity(
+  warning: Warning
+): string {
+  return JSON.stringify([
+    warning.kind,
+    warning.value,
+    warning.file ?? null,
+    normalizeLocations(warning.location)
+  ]);
+}
+
+/**
+ * Extract the first real start position of a warning.
+ *
+ * Warnings falling back to the file root location ([0, 0]) are
+ * considered to have no real position and are sorted last.
+ */
+function warningStartPosition(
+  warning: Warning
+): [line: number, column: number] | null {
+  const [first] = normalizeLocations(warning.location);
+  if (first === undefined) {
+    return null;
+  }
+  const [[line, column]] = first;
+
+  return line === 0 && column === 0 ? null : [line, column];
+}
+
+function compareWarningsByLocation(
+  left: Warning,
+  right: Warning
+): number {
+  const leftPosition = warningStartPosition(left);
+  const rightPosition = warningStartPosition(right);
+
+  if (leftPosition === null || rightPosition === null) {
+    if (leftPosition === rightPosition) {
+      return 0;
+    }
+
+    return leftPosition === null ? 1 : -1;
+  }
+
+  return leftPosition[0] - rightPosition[0] ||
+    leftPosition[1] - rightPosition[1];
+}
+
+/**
+ * Dedupe warnings sharing the same kind, value, file and original
+ * source location(s) — the same security pattern may be reported
+ * multiple times after inlining and nested eval unrolling — and
+ * sort them by their original source position.
+ *
+ * The sort is stable: warnings without a real source position keep
+ * their relative order and are moved to the end of the list.
+ */
+export function dedupeAndSortWarnings(
+  warnings: Warning[]
+): Warning[] {
+  const seen = new Set<string>();
+  const unique = warnings.filter((warning) => {
+    const identity = warningIdentity(warning);
+    if (seen.has(identity)) {
+      return false;
+    }
+    seen.add(identity);
+
+    return true;
+  });
+
+  return unique.sort(compareWarningsByLocation);
+}

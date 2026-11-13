@@ -19,6 +19,7 @@ import {
 import * as trojan from "./obfuscators/trojan-source.ts";
 import {
   PipelineRunner,
+  StringConcat,
   type Pipeline
 } from "./pipelines/index.ts";
 import { Inline } from "./pipelines/inline.ts";
@@ -38,6 +39,7 @@ import {
   type OptionalWarningName,
   type Warning
 } from "./warnings.ts";
+import { toArrayLocation } from "./utils/toArrayLocation.ts";
 import type { CollectableSet, Type } from "./CollectableSet.ts";
 import { CollectableSetRegistry } from "./CollectableSetRegistry.ts";
 
@@ -164,7 +166,11 @@ export class AstAnalyser extends EventEmitter<AstAnalyserEvents> {
       collectables = [],
       sensitivity = "conservative"
     } = options;
-    this.#pipelineRunner = new PipelineRunner([...pipelines, new Inline()]);
+    this.#pipelineRunner = new PipelineRunner([
+      ...pipelines,
+      new StringConcat(),
+      new Inline()
+    ]);
     this.#collectableSetRegistry = new CollectableSetRegistry(
       collectables ?? []
     );
@@ -278,7 +284,8 @@ export class AstAnalyser extends EventEmitter<AstAnalyserEvents> {
 
   #walkEnter(
     body: ESTree.Program["body"],
-    probeRunner: ProbeRunner
+    probeRunner: ProbeRunner,
+    evalOriginLocations: ESTree.SourceLocation[] = []
   ) {
     const recursiveWalkEnter = this.#walkEnter.bind(this);
     walkEnter(body, function walk(node) {
@@ -294,15 +301,19 @@ export class AstAnalyser extends EventEmitter<AstAnalyserEvents> {
             this.skip();
           }
 
-          if (
-            isEvalCallExpr(probeNode) &&
-            isStringLiteral(probeNode.arguments[0])
-          ) {
-            const evalBody = AstAnalyser.DefaultParser.parse(
-              probeNode.arguments[0].value,
-              void 0
+          const evalArgument = resolveEvalStringArgument(
+            probeNode,
+            probeRunner.sourceFile
+          );
+          if (evalArgument !== null) {
+            unrollEvalPayload(
+              evalArgument,
+              probeRunner,
+              {
+                evalOriginLocations,
+                recursiveWalkEnter: recursiveWalkEnter as RecursiveWalkEnter
+              }
             );
-            recursiveWalkEnter(evalBody, probeRunner);
           }
         }
       );
@@ -506,7 +517,119 @@ function isEvalCallExpr(
   );
 }
 
+interface EvalStringArgument {
+  value: string;
+  location: ESTree.SourceLocation | null;
+}
+
+type RecursiveWalkEnter = (
+  body: ESTree.Program["body"],
+  probeRunner: ProbeRunner,
+  evalOriginLocations: ESTree.SourceLocation[]
+) => void;
+
+interface EvalWalkContext {
+  evalOriginLocations: ESTree.SourceLocation[];
+  recursiveWalkEnter: RecursiveWalkEnter;
+}
+
+/**
+ * Resolve the payload of an eval() CallExpression back to a string.
+ *
+ * Supports plain string Literals (including Literals rebuilt from
+ * string concatenations by the StringConcat pipeline) and identifiers
+ * assigned a string Literal.
+ */
+function resolveEvalStringArgument(
+  node: ESTree.Node,
+  sourceFile: SourceFile
+): EvalStringArgument | null {
+  if (!isEvalCallExpr(node)) {
+    return null;
+  }
+  const [argument] = node.arguments;
+  if (argument === undefined) {
+    return null;
+  }
+  if (isStringLiteral(argument)) {
+    return {
+      value: argument.value,
+      location: argument.loc ?? node.loc ?? null
+    };
+  }
+  if (argument.type === "Identifier") {
+    const value = sourceFile.tracer.resolveLiteralIdentifier(argument.name);
+    if (value !== null) {
+      return {
+        value,
+        location: argument.loc ?? node.loc ?? null
+      };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Parse and walk the payload of an eval() CallExpression.
+ *
+ * Warnings raised while unrolling the payload are re-attributed to the
+ * location of the original Literal in the source file (with file
+ * attribution) instead of locations relative to the evaluated string.
+ */
+function unrollEvalPayload(
+  evalArgument: EvalStringArgument,
+  probeRunner: ProbeRunner,
+  walkContext: EvalWalkContext
+): void {
+  const { evalOriginLocations, recursiveWalkEnter } = walkContext;
+  let evalBody: ESTree.Program["body"];
+  try {
+    evalBody = AstAnalyser.DefaultParser.parse(
+      evalArgument.value,
+      void 0
+    );
+  }
+  catch {
+    // The deobfuscated payload is not parseable JavaScript.
+    return;
+  }
+
+  const { sourceFile } = probeRunner;
+  const warningsStart = sourceFile.warnings.length;
+
+  if (evalArgument.location !== null) {
+    evalOriginLocations.push(evalArgument.location);
+    sourceFile.locationOverride = evalOriginLocations[0];
+  }
+  try {
+    recursiveWalkEnter(evalBody, probeRunner, evalOriginLocations);
+  }
+  finally {
+    if (evalArgument.location !== null) {
+      evalOriginLocations.pop();
+      sourceFile.locationOverride = evalOriginLocations[0] ?? null;
+    }
+  }
+
+  const originLocation = evalOriginLocations[0] ?? evalArgument.location;
+  if (originLocation === null) {
+    return;
+  }
+  const originArrayLocation = toArrayLocation(originLocation);
+  const file = sourceFile.path.location;
+  for (let index = warningsStart; index < sourceFile.warnings.length; index++) {
+    const warning = sourceFile.warnings[index];
+    sourceFile.warnings[index] = {
+      ...warning,
+      location: Array.isArray(warning.location?.[0]?.[0]) ?
+        [originArrayLocation] :
+        originArrayLocation,
+      ...(file === null ? {} : { file })
+    };
+  }
+}
+
 function isPattern(warning: OptionalWarningName | `${string}.*`): warning is `${string}.*` {
   return warning.endsWith(".*");
 }
-

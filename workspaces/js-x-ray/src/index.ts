@@ -7,6 +7,7 @@ export * from "./parsers/JsSourceParser.ts";
 export * from "./parsers/TsSourceParser.ts";
 export {
   Pipelines,
+  StringConcat,
   type Pipeline
 } from "./pipelines/index.ts";
 export * from "./SourceFile.ts";
