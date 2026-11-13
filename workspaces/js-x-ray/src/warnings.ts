@@ -22,6 +22,7 @@ export type OptionalWarningName =
 
 export type WarningName =
   | "parsing-error"
+  | "probe-error"
   | "encoded-literal"
   | "unsafe-regex"
   | "unsafe-stmt"
@@ -56,6 +57,11 @@ export interface Warning<T = WarningName> {
 export const warnings = Object.freeze({
   "parsing-error": {
     i18n: "sast_warnings.parsing_error",
+    severity: "Information",
+    experimental: false
+  },
+  "probe-error": {
+    i18n: "sast_warnings.probe_error",
     severity: "Information",
     experimental: false
   },
@@ -234,4 +240,3 @@ export function generateWarning<T extends WarningName>(
     ...(notNullOrUndefined(value) ? { value } : { value: null })
   };
 }
-

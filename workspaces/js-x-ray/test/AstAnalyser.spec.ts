@@ -6,11 +6,11 @@ import assert from "node:assert";
 import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, it, type TestContext } from "node:test";
+import { describe, it, mock, type TestContext } from "node:test";
 
 // Import Internal Dependencies
 import { AstAnalyser, type Dependency, JsSourceParser } from "../src/index.ts";
-import { ProbeRunner } from "../src/ProbeRunner.ts";
+import { ProbeRunner, type Probe } from "../src/ProbeRunner.ts";
 import { SourceFile } from "../src/SourceFile.ts";
 import { FakeSourceParser } from "./fixtures/FakeSourceParser.ts";
 import {
@@ -358,6 +358,111 @@ describe("AstAnalyser", () => {
 
         assert.deepEqual(calls, ["initialize", "finalize"]);
       });
+    });
+  });
+
+  describe("probe error isolation", () => {
+    const kThrowingProbe: Probe = {
+      name: "throwingProbe",
+      validateNode: (node) => [node.type === "VariableDeclaration"],
+      main: () => {
+        throw new Error("boom");
+      }
+    };
+
+    it("should not fail the whole analysis when a custom probe main throws", () => {
+      const result = new AstAnalyser({
+        customProbes: [...customProbes, kThrowingProbe]
+      }).analyse(kIncriminedCodeSampleCustomProbe);
+
+      const kinds = result.warnings.map((warning) => warning.kind);
+      assert.ok(kinds.includes("unsafe-stmt"), "default probe findings should be preserved");
+      assert.ok(kinds.includes("unsafe-import"), "default probe findings should be preserved");
+      assert.ok(kinds.includes("unsafe-danger"), "custom probe findings should be preserved");
+      assert.ok(kinds.includes("probe-error"));
+
+      const probeError = result.warnings.find(
+        (warning) => warning.kind === "probe-error"
+      )!;
+      assert.strictEqual(
+        probeError.value,
+        'probe "throwingProbe" main error: boom'
+      );
+      assert.ok(Array.isArray(probeError.location));
+    });
+
+    it("should isolate a failing validateNode and keep subsequent probes running", () => {
+      const healthyProbe: Probe = {
+        name: "healthyProbe",
+        validateNode: (node) => [node.type === "Literal"],
+        main: (_node, ctx) => {
+          ctx.sourceFile.warnings.push({
+            kind: "unsafe-danger",
+            value: null,
+            location: null,
+            source: "JS-X-Ray Custom Probe",
+            i18n: "sast_warnings.unsafe-danger",
+            severity: "Warning"
+          });
+
+          return null;
+        }
+      };
+      const failingValidateProbe: Probe = {
+        name: "failingValidateProbe",
+        validateNode: () => {
+          throw new Error("validate boom");
+        },
+        main: () => null
+      };
+
+      const result = new AstAnalyser({
+        customProbes: [failingValidateProbe, healthyProbe],
+        skipDefaultProbes: true
+      }).analyse("const foo = 'bar';");
+
+      const kinds = result.warnings.map((warning) => warning.kind);
+      assert.ok(kinds.includes("unsafe-danger"));
+      assert.ok(kinds.includes("probe-error"));
+
+      const probeError = result.warnings.find(
+        (warning) => warning.kind === "probe-error"
+      )!;
+      assert.strictEqual(
+        probeError.value,
+        'probe "failingValidateProbe" validate error: validate boom'
+      );
+    });
+
+    it("should return ok:true and preserve warnings when a probe throws during analyseFile", async() => {
+      const result = await new AstAnalyser({
+        customProbes: [...customProbes, kThrowingProbe]
+      }).analyseFile(new URL("customProbe.js", kFixtureURL));
+
+      assert.strictEqual(result.ok, true);
+      const kinds = result.warnings.map((warning) => warning.kind);
+      assert.ok(kinds.includes("unsafe-danger"));
+      assert.ok(kinds.includes("probe-error"));
+    });
+
+    it("should still run probe finalize hooks exactly once when a probe fails", async() => {
+      const finalize = mock.fn();
+      const analyser = new AstAnalyser({
+        customProbes: [
+          kThrowingProbe,
+          {
+            name: "finalizedProbe",
+            validateNode: () => [false],
+            main: () => null,
+            finalize
+          }
+        ],
+        skipDefaultProbes: true
+      });
+
+      await analyser.analyseFile(new URL("customProbe.js", kFixtureURL));
+
+      assert.strictEqual(finalize.mock.calls.length, 1);
     });
   });
 

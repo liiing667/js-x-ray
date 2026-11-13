@@ -1,5 +1,6 @@
 export const sast_warnings = {
   parsing_error: "An error occured when parsing the JavaScript code with meriyah. It mean that the conversion from string to AST has failed. If you encounter such an error, please open an issue here.",
+  probe_error: "A security probe failed during the analysis. Findings collected before the failure are preserved, but the analysis may be incomplete.",
   unsafe_import: "Unable to follow an import (require, require.resolve) statement/expr.",
   unsafe_regex: "A RegEx as been detected as unsafe and may be used for a ReDoS Attack.",
   unsafe_stmt: "Usage of dangerous statement like eval() or Function(\"\").",

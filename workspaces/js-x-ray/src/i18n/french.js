@@ -2,6 +2,7 @@ export const sast_warnings = {
   parsing_error: `Une erreur s'est produite lors de l'analyse du code JavaScript avec meriyah.
               Cela signifie que la conversion de la chaîne de caractères AST a échoué.
               Si vous rencontrez une telle erreur, veuillez ouvrir une issue.`,
+  probe_error: "Une sonde de sécurité a échoué pendant l'analyse. Les résultats collectés avant l'échec sont conservés, mais l'analyse peut être incomplète.",
   unsafe_import: "Impossible de suivre l'import (require, require.resolve) statement/expr.",
   unsafe_regex: "Un RegEx a été détecté comme non sûr et peut être utilisé pour une attaque ReDoS.",
   unsafe_stmt: "Utilisation d'instructions dangereuses comme eval() ou Function(\"\").",

@@ -7,6 +7,7 @@ import type { ESTree } from "meriyah";
 
 // Import Internal Dependencies
 import {
+  type Probe,
   type ProbeContext,
   ProbeRunner
 } from "../src/ProbeRunner.ts";
@@ -505,6 +506,210 @@ describe("ProbeRunner", () => {
       pr.finalize();
 
       assert.strictEqual(fakeProbe.context, fakeCtx);
+    });
+  });
+
+  describe("error isolation", () => {
+    function createLocatedLiteral(): ESTree.Literal {
+      return {
+        type: "Literal",
+        value: "test",
+        loc: {
+          start: { line: 1, column: 0 },
+          end: { line: 1, column: 6 }
+        }
+      };
+    }
+
+    it("should isolate a validateNode failure and keep running other probes", () => {
+      const sourceFile = new SourceFile();
+      const throwingProbe: Probe = {
+        name: "throwing-validate",
+        validateNode: () => {
+          throw new Error("validate boom");
+        },
+        main: mock.fn()
+      };
+      const healthyProbe: Probe = {
+        name: "healthy",
+        validateNode: (node) => [node.type === "Literal"],
+        main: mock.fn()
+      };
+
+      const pr = new ProbeRunner(sourceFile, [throwingProbe, healthyProbe]);
+
+      const result = pr.walk(createLocatedLiteral());
+
+      assert.strictEqual(result, null);
+      assert.strictEqual((throwingProbe.main as any).mock.calls.length, 0);
+      assert.strictEqual((healthyProbe.main as any).mock.calls.length, 1);
+
+      assert.strictEqual(sourceFile.warnings.length, 1);
+      const [warning] = sourceFile.warnings;
+      assert.strictEqual(warning.kind, "probe-error");
+      assert.strictEqual(
+        warning.value,
+        'probe "throwing-validate" validate error: validate boom'
+      );
+      assert.deepStrictEqual(warning.location, [[1, 0], [1, 6]]);
+    });
+
+    it("should isolate a main failure, preserve findings and still run teardown", () => {
+      const sourceFile = new SourceFile();
+      const failingProbe: Probe = {
+        name: "failing-main",
+        validateNode: (node) => [node.type === "Literal"],
+        main: (_node, ctx) => {
+          ctx.sourceFile.warnings.push({
+            kind: "unsafe-danger",
+            value: null,
+            location: null,
+            source: "test",
+            i18n: "n/a",
+            severity: "Warning"
+          });
+          throw new Error("main boom");
+        },
+        teardown: mock.fn()
+      };
+      const healthyProbe: Probe = {
+        name: "healthy",
+        validateNode: (node) => [node.type === "Literal"],
+        main: mock.fn()
+      };
+
+      const pr = new ProbeRunner(sourceFile, [failingProbe, healthyProbe]);
+
+      const result = pr.walk(createLocatedLiteral());
+
+      assert.strictEqual(result, null);
+      assert.strictEqual((healthyProbe.main as any).mock.calls.length, 1);
+      assert.strictEqual((failingProbe.teardown as any).mock.calls.length, 1);
+
+      assert.strictEqual(sourceFile.warnings.length, 2);
+      const [finding, diagnostic] = sourceFile.warnings;
+      assert.strictEqual(finding.kind, "unsafe-danger");
+      assert.strictEqual(diagnostic.kind, "probe-error");
+      assert.strictEqual(
+        diagnostic.value,
+        'probe "failing-main" main error: main boom'
+      );
+      assert.deepStrictEqual(diagnostic.location, [[1, 0], [1, 6]]);
+    });
+
+    it("should isolate a teardown failure and keep running other probes", () => {
+      const sourceFile = new SourceFile();
+      const failingProbe: Probe = {
+        name: "failing-teardown",
+        validateNode: () => [true],
+        main: () => null,
+        teardown: () => {
+          throw new Error("teardown boom");
+        }
+      };
+      const healthyProbe: Probe = {
+        name: "healthy",
+        validateNode: () => [true],
+        main: mock.fn()
+      };
+
+      const pr = new ProbeRunner(sourceFile, [failingProbe, healthyProbe]);
+
+      const result = pr.walk(createLocatedLiteral());
+
+      assert.strictEqual(result, null);
+      assert.strictEqual((healthyProbe.main as any).mock.calls.length, 1);
+
+      assert.strictEqual(sourceFile.warnings.length, 1);
+      const [warning] = sourceFile.warnings;
+      assert.strictEqual(warning.kind, "probe-error");
+      assert.strictEqual(
+        warning.value,
+        'probe "failing-teardown" teardown error: teardown boom'
+      );
+    });
+
+    it("should cap the number of diagnostics reported for a failing probe", () => {
+      const sourceFile = new SourceFile();
+      const failingProbe: Probe = {
+        name: "always-failing",
+        validateNode: () => {
+          throw new Error("boom");
+        },
+        main: () => null
+      };
+
+      const pr = new ProbeRunner(sourceFile, [failingProbe]);
+
+      for (let i = 0; i < 10; i++) {
+        pr.walk(createLocatedLiteral());
+      }
+
+      const probeErrors = sourceFile.warnings.filter(
+        (warning) => warning.kind === "probe-error"
+      );
+      assert.strictEqual(probeErrors.length, 3);
+    });
+
+    it("should truncate long error messages to keep diagnostics stable", () => {
+      const sourceFile = new SourceFile();
+      const failingProbe: Probe = {
+        name: "verbose-failure",
+        validateNode: () => {
+          throw new Error("x".repeat(500));
+        },
+        main: () => null
+      };
+
+      const pr = new ProbeRunner(sourceFile, [failingProbe]);
+      pr.walk(createLocatedLiteral());
+
+      assert.strictEqual(sourceFile.warnings.length, 1);
+      const [warning] = sourceFile.warnings;
+      assert.strictEqual(
+        warning.value,
+        `probe "verbose-failure" validate error: ${"x".repeat(200)}…`
+      );
+    });
+
+    it("should isolate finalize failures and run finalize hooks only once", () => {
+      const sourceFile = new SourceFile();
+      sourceFile.tracer.on("fake-event", () => {
+        // ignored
+      });
+
+      const failingProbe: Probe = {
+        name: "failing-finalize",
+        validateNode: () => [false],
+        main: () => null,
+        finalize: mock.fn(() => {
+          throw new Error("finalize boom");
+        })
+      };
+      const healthyProbe: Probe = {
+        name: "healthy-finalize",
+        validateNode: () => [false],
+        main: () => null,
+        finalize: mock.fn()
+      };
+
+      const pr = new ProbeRunner(sourceFile, [failingProbe, healthyProbe]);
+
+      pr.finalize();
+      pr.finalize();
+
+      assert.strictEqual((failingProbe.finalize as any).mock.calls.length, 1);
+      assert.strictEqual((healthyProbe.finalize as any).mock.calls.length, 1);
+      assert.strictEqual(sourceFile.tracer.eventNames().length, 0);
+
+      assert.strictEqual(sourceFile.warnings.length, 1);
+      const [warning] = sourceFile.warnings;
+      assert.strictEqual(warning.kind, "probe-error");
+      assert.strictEqual(
+        warning.value,
+        'probe "failing-finalize" finalize error: finalize boom'
+      );
+      assert.deepStrictEqual(warning.location, [[0, 0], [0, 0]]);
     });
   });
 });

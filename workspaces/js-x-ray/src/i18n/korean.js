@@ -1,5 +1,6 @@
 export const sast_warnings = {
   parsing_error: "meriyah로 JavaScript 코드를 파싱하는 중 오류가 발생했습니다. 문자열에서 AST로의 변환이 실패했음을 의미합니다. 이 오류가 발생하면 이슈를 등록해 주세요.",
+  probe_error: "분석 중 보안 프로브에서 오류가 발생했습니다. 오류 발생 전에 수집된 결과는 유지되지만 분석이 불완전할 수 있습니다.",
   unsafe_import: "import (require, require.resolve) 구문/표현식을 추적할 수 없습니다.",
   unsafe_regex: "안전하지 않은 정규식이 감지되었으며, ReDoS 공격에 악용될 수 있습니다.",
   unsafe_stmt: "eval() 또는 Function(\"\")과 같은 위험한 구문이 사용되었습니다.",

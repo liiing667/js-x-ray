@@ -37,7 +37,10 @@ import {
 
 import type { TracedIdentifierReport } from "./VariableTracer.ts";
 import type { SourceFile } from "./SourceFile.ts";
-import type { OptionalWarningName } from "./warnings.ts";
+import {
+  generateWarning,
+  type OptionalWarningName
+} from "./warnings.ts";
 import {
   getCallExpressionIdentifier,
   type GetCallExpressionIdentifierOptions,
@@ -47,6 +50,17 @@ import { CALL_EXPRESSION_DATA, CALL_EXPRESSION_IDENTIFIER } from "./contants.ts"
 import type { NodeOfType, ProbeNodeType } from "./defineProbe.ts";
 
 const kProbeOriginalContext = Symbol.for("ProbeOriginalContext");
+const kMaximumProbeErrorsPerProbe = 3;
+const kMaximumProbeErrorMessageLength = 200;
+
+export type ProbePhase = "validate" | "main" | "teardown" | "finalize";
+
+export interface ProbeErrorReport {
+  probe: Probe;
+  phase: ProbePhase;
+  error: unknown;
+  node?: ESTree.Node;
+}
 
 export type ProbeReturn = void | null | symbol;
 export type ProbeContextDef = Record<string | symbol, any>;
@@ -107,6 +121,8 @@ export class ProbeRunner {
   #nodeTypeIndex = new Map<ProbeNodeType, Probe[]>();
   #catchAllProbes: Probe[] = [];
   #callExprIdentifierOptions: GetCallExpressionIdentifierOptions;
+  #probeErrorCounts = new Map<Probe, number>();
+  #finalized = false;
 
   static Signals = Object.freeze({
     Break: Symbol.for("breakWalk"),
@@ -282,10 +298,18 @@ export class ProbeRunner {
     const ctx = this.#getProbeContext(probe);
 
     for (const validateNode of validationFns) {
-      const [isMatching, data = null] = validateNode(
-        node,
-        ctx
-      );
+      let isMatching: boolean;
+      let data: any;
+      try {
+        [isMatching, data = null] = validateNode(
+          node,
+          ctx
+        );
+      }
+      catch (error) {
+        this.#reportProbeError({ probe, phase: "validate", error, node });
+        continue;
+      }
       if (!isMatching) {
         continue;
       }
@@ -297,10 +321,41 @@ export class ProbeRunner {
       mainCtx.context = probe.context;
       mainCtx.data = data;
 
-      return mainHandler(node, mainCtx);
+      try {
+        return mainHandler(node, mainCtx);
+      }
+      catch (error) {
+        this.#reportProbeError({ probe, phase: "main", error, node });
+
+        return null;
+      }
     }
 
     return null;
+  }
+
+  #reportProbeError(
+    report: ProbeErrorReport
+  ): void {
+    const { probe, phase, error, node } = report;
+    const errorCount = this.#probeErrorCounts.get(probe) ?? 0;
+    if (errorCount >= kMaximumProbeErrorsPerProbe) {
+      return;
+    }
+    this.#probeErrorCounts.set(probe, errorCount + 1);
+
+    const probeName = probe.name ?? "anonymous";
+    const message = error instanceof Error ? error.message : String(error);
+    const truncatedMessage = message.length > kMaximumProbeErrorMessageLength ?
+      `${message.slice(0, kMaximumProbeErrorMessageLength)}…` :
+      message;
+
+    this.sourceFile.warnings.push(
+      generateWarning("probe-error", {
+        value: `probe "${probeName}" ${phase} error: ${truncatedMessage}`,
+        location: node?.loc ?? null
+      })
+    );
   }
 
   walk(
@@ -353,7 +408,12 @@ export class ProbeRunner {
         }
       }
       finally {
-        probe.teardown?.(this.#getProbeContext(probe));
+        try {
+          probe.teardown?.(this.#getProbeContext(probe));
+        }
+        catch (error) {
+          this.#reportProbeError({ probe, phase: "teardown", error, node });
+        }
         if (probe.context) {
           delete probe.context[CALL_EXPRESSION_DATA];
           delete probe.context[CALL_EXPRESSION_IDENTIFIER];
@@ -365,12 +425,26 @@ export class ProbeRunner {
   }
 
   finalize(): void {
-    for (const probe of this.probes) {
-      probe.finalize?.(this.#getProbeContext(probe));
-      if (Object.hasOwn(probe, kProbeOriginalContext)) {
-        probe.context = probe[kProbeOriginalContext];
+    if (this.#finalized) {
+      return;
+    }
+    this.#finalized = true;
+
+    try {
+      for (const probe of this.probes) {
+        try {
+          probe.finalize?.(this.#getProbeContext(probe));
+        }
+        catch (error) {
+          this.#reportProbeError({ probe, phase: "finalize", error });
+        }
+        if (Object.hasOwn(probe, kProbeOriginalContext)) {
+          probe.context = probe[kProbeOriginalContext];
+        }
       }
     }
-    this.sourceFile.tracer.removeAllListeners();
+    finally {
+      this.sourceFile.tracer.removeAllListeners();
+    }
   }
 }

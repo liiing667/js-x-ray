@@ -1,5 +1,6 @@
 export const sast_warnings = {
   parsing_error: "JavaScript kodu meriyah ile ayrıştırılırken bir hata oluştu. Bu, dizeden AST'ye dönüşümün başarısız olduğu anlamına gelir. Böyle bir hatayla karşılaşırsanız lütfen burada bir sorun (issue) açın.",
+  probe_error: "Analiz sırasında bir güvenlik probu başarısız oldu. Hatadan önce toplanan bulgular korunur, ancak analiz eksik olabilir.",
   unsafe_import: "Bir içe aktarma (require, require.resolve) ifadesi/deyimi takip edilemedi.",
   unsafe_regex: "Güvensiz olduğu tespit edilen bir RegEx, ReDoS Saldırısı için kullanılabilir.",
   unsafe_stmt: "eval() veya Function(\"\") gibi tehlikeli ifadelerin kullanımı.",

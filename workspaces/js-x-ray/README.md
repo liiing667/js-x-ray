@@ -134,6 +134,7 @@ type OptionalWarningName =
 
 type WarningName =
   | "parsing-error"
+  | "probe-error"
   | "encoded-literal"
   | "unsafe-regex"
   | "unsafe-stmt"
@@ -262,6 +263,7 @@ Click on the warning **name** for detailed documentation and examples.
 | Name | Experimental | Description |
 | --- | :-: | --- |
 | [parsing-error](https://github.com/NodeSecure/js-x-ray/blob/master/docs/parsing-error.md) | No | AST parser encountered an error while analyzing the code |
+| [probe-error](https://github.com/NodeSecure/js-x-ray/blob/master/docs/probe-error.md) | No | A security probe failed during analysis (failure isolated, findings preserved) |
 | [encoded-literal](https://github.com/NodeSecure/js-x-ray/blob/master/docs/encoded-literal.md) | No | Encoded literal detected (hexadecimal, Unicode, base64) |
 | [log-usage](https://github.com/NodeSecure/js-x-ray/blob/master/docs/log-usage.md) ⚠️ | No | Usage of logging functions (console.log, logger methods, etc.) |
 
