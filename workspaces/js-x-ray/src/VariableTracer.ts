@@ -16,6 +16,11 @@ import {
   toLiteral
 } from "./estree/index.ts";
 import {
+  createTracerScope,
+  isWithinScope,
+  type TracerScope
+} from "./VariableTracerScope.ts";
+import {
   getSubMemberExpressionSegments,
   isEvilIdentifierPath,
   isNeutralCallable,
@@ -160,9 +165,17 @@ export class VariableTracer extends EventEmitter {
 
   // PRIVATE PROPERTIES
   #traced = new Map<string, Traced>();
+  /**
+   * Names registered through trace() (require, eval, module names...).
+   * Unlike aliases, patterns are global and cannot be shadowed by
+   * local declarations.
+   */
+  #tracedPatterns = new Set<string>();
   #variablesRefToGlobal = new Set<string>();
   #neutralCallable = new Set<string>();
   #assignedReturnValueToTraced = new Map<string, string>();
+  #scopes: TracerScope<Traced>[] = [];
+  #declarationKind: ESTree.VariableDeclaration["kind"] | "import" | null = null;
 
   debug() {
     console.log(this.#traced);
@@ -171,6 +184,140 @@ export class VariableTracer extends EventEmitter {
   resolveLiteralIdentifier = (name: string): string | null => (
     this.literalIdentifiers.get(name)?.value ?? null
   );
+
+  /**
+   * Resolve a traced identifier through the lexical scope chain.
+   * A name declared in an inner scope shadows any outer traced alias.
+   * Traced patterns (require, eval...) are global and never shadowed.
+   */
+  #lookupTraced(
+    identifierOrMemberExpr: string
+  ): Traced | undefined {
+    for (let i = this.#scopes.length - 1; i >= 0; i--) {
+      const scope = this.#scopes[i];
+      const alias = scope.aliases.get(identifierOrMemberExpr);
+      if (alias !== undefined) {
+        return alias;
+      }
+      if (
+        scope.shadows.has(identifierOrMemberExpr) &&
+        !this.#tracedPatterns.has(identifierOrMemberExpr)
+      ) {
+        return undefined;
+      }
+    }
+
+    return this.#traced.get(identifierOrMemberExpr);
+  }
+
+  #lookupAssignedReturnValue(
+    name: string
+  ): string | undefined {
+    for (let i = this.#scopes.length - 1; i >= 0; i--) {
+      const scope = this.#scopes[i];
+      const assigned = scope.assignedReturnValues.get(name);
+      if (assigned !== undefined) {
+        return assigned;
+      }
+      if (scope.shadows.has(name)) {
+        return undefined;
+      }
+    }
+
+    return this.#assignedReturnValueToTraced.get(name);
+  }
+
+  #hasTraced(
+    identifierOrMemberExpr: string
+  ): boolean {
+    return this.#lookupTraced(identifierOrMemberExpr) !== undefined;
+  }
+
+  /**
+   * Select the scope in which a new declaration must be registered:
+   * - var declarations hoist to the nearest function scope
+   * - let/const declarations belong to the innermost (block) scope
+   * - import declarations and top-level declarations belong to the root
+   */
+  #selectDeclarationScope(): TracerScope<Traced> | null {
+    if (this.#declarationKind === "var") {
+      for (let i = this.#scopes.length - 1; i >= 0; i--) {
+        if (this.#scopes[i].kind === "function") {
+          return this.#scopes[i];
+        }
+      }
+
+      return null;
+    }
+    if (this.#declarationKind === "import") {
+      return null;
+    }
+
+    return this.#scopes.length > 0 ?
+      this.#scopes[this.#scopes.length - 1] :
+      null;
+  }
+
+  #registerTracedAlias(
+    name: string,
+    tracedVariant: Traced
+  ): boolean {
+    const scope = this.#selectDeclarationScope();
+    if (scope === null) {
+      if (this.#traced.has(name)) {
+        return false;
+      }
+      this.#traced.set(name, tracedVariant);
+
+      return true;
+    }
+    if (scope.aliases.has(name)) {
+      return false;
+    }
+    scope.shadows.delete(name);
+    scope.aliases.set(name, tracedVariant);
+
+    return true;
+  }
+
+  #registerAssignedReturnValue(
+    name: string,
+    tracedFullIdentifierName: string
+  ): void {
+    const scope = this.#selectDeclarationScope();
+    if (scope === null) {
+      this.#assignedReturnValueToTraced.set(name, tracedFullIdentifierName);
+
+      return;
+    }
+    scope.shadows.delete(name);
+    scope.assignedReturnValues.set(name, tracedFullIdentifierName);
+  }
+
+  /**
+   * Synchronize the lexical scope stack with the walked node:
+   * scopes whose range does not contain the node are popped, and
+   * scope-creating nodes (functions, blocks, catch, loops) push a
+   * new scope pre-populated with their declared (hoisted) names.
+   */
+  #syncScopes(
+    node: ESTree.Node
+  ): void {
+    const { loc } = node;
+    if (loc) {
+      while (
+        this.#scopes.length > 0 &&
+        !isWithinScope(loc.start, this.#scopes[this.#scopes.length - 1])
+      ) {
+        this.#scopes.pop();
+      }
+
+      const scope = createTracerScope(node);
+      if (scope !== null) {
+        this.#scopes.push(scope as TracerScope<Traced>);
+      }
+    }
+  }
 
   enableDefaultTracing() {
     [...kRequirePatterns]
@@ -207,6 +354,7 @@ export class VariableTracer extends EventEmitter {
       assignmentMemory: [],
       moduleName
     });
+    this.#tracedPatterns.add(identifierOrMemberExpr);
 
     if (identifierOrMemberExpr.includes(".")) {
       for (const expr of getSubMemberExpressionSegments(identifierOrMemberExpr)) {
@@ -234,26 +382,25 @@ export class VariableTracer extends EventEmitter {
     }
 
     const isMemberExpr = identifierOrMemberExpr.includes(".");
-    const isTracingIdentifier = this.#traced.has(identifierOrMemberExpr);
 
-    let finalIdentifier = identifierOrMemberExpr;
-    if (isMemberExpr && !isTracingIdentifier) {
+    let tracedIdentifier = this.#lookupTraced(identifierOrMemberExpr);
+    if (isMemberExpr && tracedIdentifier === undefined) {
       const [segment] = identifierOrMemberExpr.split(".");
-      if (this.#traced.has(segment)) {
-        const tracedIdentifier = this.#traced.get(segment)!;
+      const tracedSegment = this.#lookupTraced(segment);
+      if (tracedSegment !== undefined) {
         const memberExprSuffix = identifierOrMemberExpr.slice(segment.length);
-        finalIdentifier = `${tracedIdentifier.identifierOrMemberExpr}${memberExprSuffix}`;
+        const finalIdentifier = `${tracedSegment.identifierOrMemberExpr}${memberExprSuffix}`;
+        tracedIdentifier = this.#lookupTraced(finalIdentifier);
       }
 
-      if (!this.#traced.has(finalIdentifier)) {
+      if (tracedIdentifier === undefined) {
         return null;
       }
     }
-    else if (!isTracingIdentifier) {
+    else if (tracedIdentifier === undefined) {
       return null;
     }
 
-    const tracedIdentifier = this.#traced.get(finalIdentifier)!;
     if (!this.#isTracedIdentifierImportedAsModule(tracedIdentifier)) {
       return null;
     }
@@ -270,7 +417,7 @@ export class VariableTracer extends EventEmitter {
   #getTracedName(
     identifierOrMemberExpr: string
   ): string | null {
-    return this.#traced.get(identifierOrMemberExpr)?.name ?? null;
+    return this.#lookupTraced(identifierOrMemberExpr)?.name ?? null;
   }
 
   #isTracedIdentifierImportedAsModule(
@@ -283,7 +430,7 @@ export class VariableTracer extends EventEmitter {
     identifierOrMemberExpr: string,
     id: ESTree.Identifier
   ) {
-    const tracedVariant = this.#traced.get(identifierOrMemberExpr);
+    const tracedVariant = this.#lookupTraced(identifierOrMemberExpr);
 
     /*
      * We return if required module has not been imported
@@ -307,12 +454,14 @@ export class VariableTracer extends EventEmitter {
     this.emit(VariableTracer.AssignmentEvent, assignmentEventPayload);
     this.emit(tracedVariant.identifierOrMemberExpr, assignmentEventPayload);
 
-    if (tracedVariant.followConsecutiveAssignment && !this.#traced.has(newIdentiferName)) {
-      this.#traced.get(tracedVariant.name)!.assignmentMemory.push({
-        type: "AliasBinding",
-        name: newIdentiferName
-      });
-      this.#traced.set(newIdentiferName, tracedVariant);
+    if (tracedVariant.followConsecutiveAssignment) {
+      const isRegistered = this.#registerTracedAlias(newIdentiferName, tracedVariant);
+      if (isRegistered) {
+        this.#traced.get(tracedVariant.name)!.assignmentMemory.push({
+          type: "AliasBinding",
+          name: newIdentiferName
+        });
+      }
     }
   }
 
@@ -334,8 +483,9 @@ export class VariableTracer extends EventEmitter {
     parts: string[] = []
   ): string[] {
     return parts.flatMap((identifierName) => {
-      if (this.#traced.has(identifierName)) {
-        return this.#traced.get(identifierName)!.identifierOrMemberExpr;
+      const tracedVariant = this.#lookupTraced(identifierName);
+      if (tracedVariant !== undefined) {
+        return tracedVariant.identifierOrMemberExpr;
       }
 
       /**
@@ -358,7 +508,7 @@ export class VariableTracer extends EventEmitter {
     for (const { name, assignmentId } of getVariableDeclarationIdentifiers(id)) {
       const identifierOrMemberExpr = typeof prefix === "string" ? `${prefix}.${name}` : name;
 
-      if (this.#traced.has(identifierOrMemberExpr)) {
+      if (this.#hasTraced(identifierOrMemberExpr)) {
         this.#declareNewAssignment(identifierOrMemberExpr, assignmentId);
       }
     }
@@ -566,17 +716,13 @@ export class VariableTracer extends EventEmitter {
         const tracedFullIdentifierName = this.#getTracedName(fullIdentifierPath) ?? fullIdentifierPath;
         const [identifierName] = fullIdentifierPath.split(".");
 
-        let tracedVariant: Traced | undefined;
-
-        if (this.#traced.has(tracedFullIdentifierName)) {
-          tracedVariant = this.#traced.get(tracedFullIdentifierName);
-        }
-        else {
+        let tracedVariant = this.#lookupTraced(tracedFullIdentifierName);
+        if (tracedVariant === undefined) {
           const alternativeMemberExprParts = this.#searchForMemberExprAlternative(
             tracedFullIdentifierName.split(".")
           );
           const alternativeMemberExprFullname = alternativeMemberExprParts.join(".");
-          tracedVariant = this.#traced.get(alternativeMemberExprFullname);
+          tracedVariant = this.#lookupTraced(alternativeMemberExprFullname);
         }
 
         if (tracedVariant?.followReturnValueAssignement) {
@@ -594,7 +740,7 @@ export class VariableTracer extends EventEmitter {
           };
           this.emit(VariableTracer.ReturnValueEvent, returnValueEventPayload);
           if (tracedVariant.followConsecutiveAssignment) {
-            this.#assignedReturnValueToTraced.set(id.name, tracedFullIdentifierName);
+            this.#registerAssignedReturnValue(id.name, tracedFullIdentifierName);
           }
         }
         if (childNode.type !== "CallExpression") {
@@ -625,21 +771,21 @@ export class VariableTracer extends EventEmitter {
       // const r = require
       case "Identifier": {
         const identifierName = childNode.name;
-        if (this.#traced.has(identifierName)) {
+        if (this.#hasTraced(identifierName)) {
           this.#declareNewAssignment(identifierName, id);
         }
         else if (this.#isGlobalVariableIdentifier(identifierName)) {
           this.#variablesRefToGlobal.add(id.name);
         }
 
-        if (this.#assignedReturnValueToTraced.has(childNode.name)) {
-          const tracedFullIdentifierName = this.#assignedReturnValueToTraced.get(childNode.name)!;
-          const tracedVariant = this.#traced.get(tracedFullIdentifierName)!;
+        const tracedFullIdentifierName = this.#lookupAssignedReturnValue(childNode.name);
+        if (tracedFullIdentifierName !== undefined) {
+          const tracedVariant = this.#lookupTraced(tracedFullIdentifierName)!;
           tracedVariant.assignmentMemory.push({
             type: "ReturnValueAssignment",
             name: id.name
           });
-          this.#assignedReturnValueToTraced.set(id.name, tracedFullIdentifierName);
+          this.#registerAssignedReturnValue(id.name, tracedFullIdentifierName);
         }
 
         break;
@@ -662,14 +808,14 @@ export class VariableTracer extends EventEmitter {
         if (isNeutralCallable(memberExprFullname)) {
           this.#neutralCallable.add(id.name);
         }
-        else if (this.#traced.has(memberExprFullname)) {
+        else if (this.#hasTraced(memberExprFullname)) {
           this.#declareNewAssignment(memberExprFullname, id);
         }
         else {
           const alternativeMemberExprParts = this.#searchForMemberExprAlternative(memberExprParts);
           const alternativeMemberExprFullname = alternativeMemberExprParts.join(".");
 
-          if (this.#traced.has(alternativeMemberExprFullname)) {
+          if (this.#hasTraced(alternativeMemberExprFullname)) {
             this.#declareNewAssignment(alternativeMemberExprFullname, id);
           }
         }
@@ -762,15 +908,21 @@ export class VariableTracer extends EventEmitter {
   walk(
     node: ESTree.Node
   ): void {
+    this.#syncScopes(node);
+
     switch (node.type) {
       case "ImportDeclaration": {
+        this.#declarationKind = "import";
         this.#walkImportDeclaration(node);
+        this.#declarationKind = null;
         break;
       }
       case "VariableDeclaration": {
+        this.#declarationKind = node.kind;
         node.declarations.forEach(
           (node) => this.#walkVariableDeclarator(node)
         );
+        this.#declarationKind = null;
         break;
       }
     }
